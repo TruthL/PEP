@@ -103,3 +103,8 @@ If you encounter an error message (displayed in the terminal) that indicates tha
 1. Perhaps move GUI from Tkinter to Plotly Dash due to better support for data visualization and version control.
 1. Add a field to ignore certain groups (such as Admin, as to not bloat the output file).
 ---
+
+### Changes made to original PEP:
+- Code reads in csv files from SunLearn.
+- Student ratings should sum up to 100, student is required to rate themselves.
+- Filtering of raw csv files. This should be edited to fit needs.
