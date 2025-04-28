@@ -39,9 +39,12 @@ def out(message : str, type="string") :
             f.write(message.to_string()+"\n")
             # print(message.to_string())
 
-def get_data(path : str, filter:bool=False) -> pd.DataFrame:
+def get_data(path : str, filter:bool=True) -> pd.DataFrame:
     '''
-    This method reads the data file and returns a dataframe with the data.
+    This method reads the raw data file and returns a dataframe with the data.
+    Things to check:
+        - Get the most recent response from the students (submitted time)
+        - check that the ratings add up to 100 exactly
     
     Parameters
     ----------
@@ -59,19 +62,48 @@ def get_data(path : str, filter:bool=False) -> pd.DataFrame:
 
     if filter:
         # subject to how the questionaire was set
-        response_headers = ['Username', 'Q01_Group number',\
-        'Q03_Student number - self', 'Q04_Rating for yourself',\
-        'Q06_Student no. of group member #2', 'Q07_Rating for student #2',\
-        'Q09_Student no. of group member #3', 'Q10_Rating for student #3',\
-        'Q12_Student no. of group member #4', 'Q13_Rating for student #4']
+        response_headers = ['ID','Submitted on:','Username', 'Q01_Group number',\
+        'Q03_Student number - self', 'Q04_Rating for yourself','Q05_Commentary for yourself',\
+        'Q06_Student no. of group member #2', 'Q07_Rating for student #2','Q08_Commentary for group member #2',\
+        'Q09_Student no. of group member #3', 'Q10_Rating for student #3','Q11_Commentary for group member #3',\
+        'Q12_Student no. of group member #4', 'Q13_Rating for student #4','Q14_Commentary for group member #4',]
         try:
             responses = responses[response_headers]
         except:
             raise IOError(f"Error in getting headers\nPlease make sure that the header names are correct.")
 
-        new_headers = ['SU#', 'Group#', 'student1','rating1','student2','rating2','student3','rating3','student4','rating4']
+        responses["Submitted on:"] = pd.to_datetime(responses["Submitted on:"], format="%d/%m/%Y %H:%M:%S")
+        responses = responses.sort_values(["ID", "Submitted on:"])
+        responses = responses.drop_duplicates(subset=["ID"], keep="last").reset_index(drop=True)
+        responses = responses.drop(columns=["ID", "Submitted on:"])
+        new_headers = ['SU#', 'Group#', 'student1','rating1','comment1','student2','rating2','comment2',\
+                       'student3','rating3','comment3','student4','rating4','comment4']
         responses.rename(columns=dict(zip(responses.columns, new_headers)), inplace=True)
-        responses.to_csv('filtered_response.csv',index=False)
+        for col in responses.columns:
+            if col.startswith("student"):
+                responses[col] = responses[col].astype(object)
+        # Ensure ratings add to 100
+        rating_cols = ['rating1', 'rating2', 'rating3', 'rating4']
+
+        for idx, row in responses.iterrows():
+            ratings = row[rating_cols].dropna()
+            total = ratings.sum()
+
+            if total < 100:
+                # Distribute the missing points to rating2, rating3, rating4
+                missing = 100 - total
+                members = [col for col in rating_cols[1:] if not pd.isna(row[col])]
+                distribute = missing / len(members) if members else 0
+
+                for col in members:
+                    responses.at[idx, col] += distribute
+
+            elif total > 100:
+                # Subtract the excess only from rating1
+                excess = total - 100
+                responses.at[idx, 'rating1'] -= excess
+
+        responses.to_csv('files/filtered_response.csv',index=False)
 
     return responses
 
@@ -99,7 +131,8 @@ def get_groups(path : str) -> pd.DataFrame:
     groups['Size'] = groups.groupby(GROUP_NUM)[SU_NUM].transform('count')
     # make sure that the ids are all strings and not given as integers
     groups["SU#"] = list(map(str,groups["SU#"].to_list()))
-    groups['Flag'] = False
+    groups['ERROR_FLAG'] = False
+    groups['BIAS_FLAG'] = False
     return groups
 
     
@@ -125,13 +158,13 @@ def try_to_correct(member : str, group_members : list) -> str:
         return None
     
     out("Attempting to correct...")
-    member = int(member)
+    member = int(member.ljust(8, "0"))
     correction = 0
     correction_calc = 99999999
     
     for student_id in group_members:
         id_num = int(student_id)
-        calc = int(str(abs(id_num - member)).rstrip('0'))
+        calc = int(str(abs(id_num - member)).rstrip('0') or '0')
         if calc < correction_calc:
             correction = id_num
             correction_calc = calc
@@ -225,7 +258,7 @@ def process_students(groups : pd.DataFrame, data : pd.DataFrame, settings : dict
                 out("****************************************************")
                 
                 if rating == "nan" or rating == "" or rating == " " or rating == "-":
-                    groups.loc[groups[SU_NUM] == student, "Flag"] = True
+                    groups.loc[groups[SU_NUM] == student, "ERROR_FLAG"] = True
                     out("Student FLAGGED")
                     for already in range(len(pending_scores)):
                         student_mean[pending_members[already]] -= pending_scores[already]
@@ -235,7 +268,7 @@ def process_students(groups : pd.DataFrame, data : pd.DataFrame, settings : dict
                     correction = try_to_correct(member, groups[groups[GROUP_NUM] == group][SU_NUM].tolist())
                     
                     if correction is None:
-                        groups.loc[groups[SU_NUM] == student, "Flag"] = True
+                        groups.loc[groups[SU_NUM] == student, "ERROR_FLAG"] = True
                         out("Student FLAGGED")
                         
                         for already in range(len(pending_scores)):
@@ -243,10 +276,10 @@ def process_students(groups : pd.DataFrame, data : pd.DataFrame, settings : dict
                         i = group_size
                    
                     else:
-                        entry[1]["student"+str(i+1)] = correction
+                        entry[1]["student"+str(i+1)] = str(correction)
                         
                 else:
-                    groups.loc[groups[SU_NUM] == student, "Flag"] = True
+                    groups.loc[groups[SU_NUM] == student, "ERROR_FLAG"] = True
                     out("Student FLAGGED")
                     
                     for already in range(len(pending_scores)):
@@ -254,12 +287,15 @@ def process_students(groups : pd.DataFrame, data : pd.DataFrame, settings : dict
                     i = group_size
     
     # === Bias Detection Phase === #
+    if "BIAS_FLAG" not in groups.columns:
+        groups["BIAS_FLAG"] = False
+
     for group_id in groups[GROUP_NUM].unique():
         group_members = groups[groups[GROUP_NUM] == group_id][SU_NUM].astype(str).tolist()
         if len(group_members) <= 1:
             continue
 
-        # For each member, calculate average rating received from peers
+        # Collect received ratings
         member_ratings_received = {member: [] for member in group_members}
         for rater in group_members:
             for rated, score in ratings_given.get(rater, {}).items():
@@ -271,8 +307,9 @@ def process_students(groups : pd.DataFrame, data : pd.DataFrame, settings : dict
             for member, scores in member_ratings_received.items()
         }
 
-        # Compare each student's ratings to the consensus
+        # Bias checking
         for rater in group_members:
+            bias_found = False
             for rated in group_members:
                 if rated == rater:
                     continue
@@ -283,10 +320,13 @@ def process_students(groups : pd.DataFrame, data : pd.DataFrame, settings : dict
                         continue
                     deviation = abs(their_rating - avg_for_rated) / avg_for_rated
                     if deviation > settings["bias_threshold"]:
-                        groups.loc[groups[SU_NUM] == rater, "Flag"] = True
-                        out(f"Bias flagged (Group{group_id}): {rater} -> {rated} (rating: {their_rating}, avg: {avg_for_rated})")
+                        groups.loc[groups[SU_NUM] == rater, "BIAS_FLAG"] = True
+                        out(f"Bias flagged (Group {group_id}): {rater} -> {rated} (rating: {their_rating}, avg: {avg_for_rated:.2f})")
+                        bias_found = True
+                        break  # optional: break if bias found for this rater
                 except KeyError:
                     continue
+
                     
     out("--------------------------------------------")
     return student_mean, groups
@@ -317,7 +357,8 @@ def compile_results(groups : pd.DataFrame, factors : list, create : bool):
         "SU#": groups[SU_NUM].tolist(),
         "Group#": groups[GROUP_NUM].tolist(),    
         "Scaling factor": factors,
-        "Flagged": ["" if i == False else "FLAGGED" for i in groups["Flag"].tolist()],
+        "Error_Flagged": ["" if i == False else "FLAGGED" for i in groups["ERROR_FLAG"].tolist()],
+        "Bias_Flagged": ["" if i == False else "FLAGGED" for i in groups["BIAS_FLAG"].tolist()],
     })
     
     errors = results[ results["Scaling factor"] == -1]
@@ -330,7 +371,7 @@ def compile_results(groups : pd.DataFrame, factors : list, create : bool):
     out("--------------------------------------------")
     out("FLAGGED students:")
     out("--------------------------------------------")
-    out(results[results["Flagged"] == "FLAGGED"], type="df")
+    out(results[results["Error_Flagged"] == "FLAGGED"], type="df")
     out("--------------------------------------------")
 
     if not errors.empty:
@@ -426,8 +467,8 @@ def run_cmd():
         paths = [
             "files/Group_allocation.csv",
             # 'files/filtered_response.csv',
-            'files/example_response.csv',
-            # "files/Peer_Assessment_and_Plagiarism_Declaration.csv",
+            # 'files/example_response.csv',
+            "files/2025_Peer_Assessment_and_Plagiarism_Declaration.csv",
             "output"   
         ]
         mark(paths) 
